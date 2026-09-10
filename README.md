@@ -81,6 +81,22 @@ Cloud Run service for no reason. Cloud Run is the right call when the
 backend is a real persistent server (Express app, etc.) or needs something
 Functions can't do.
 
+If the backend is a persistent server that *already* serves the built
+frontend itself (a Flask/Express app with the frontend's static build
+copied into its own container, one process, one port - common in
+hackathon projects that never split frontend/backend hosting), don't
+also deploy the frontend build to Hosting separately. Just rewrite
+*everything* to Cloud Run:
+
+```json
+{ "source": "**", "run": { "serviceId": "<app>-server", "region": "us-central1" } }
+```
+
+with `public` pointing at an empty placeholder directory (Hosting still
+requires one to exist, even though nothing in it is ever served). One
+container, one deploy artifact, no risk of the Hosting-served frontend
+and the container's own copy of it drifting apart.
+
 Images and other static, rarely-changing assets that a teammate previously
 hosted on Firebase Storage: just ship them as static files through the same
 Hosting deploy instead of provisioning a Storage bucket. One less resource
@@ -126,6 +142,70 @@ gcloud functions deploy <app>-<function> \
 cd <frontend dir> && npm run build && cd -
 firebase deploy --only hosting:<app> --project vietrochack-lab
 ```
+
+## Common Cloud Run gotchas
+
+Things that will burn a build/deploy cycle each if you don't know to look
+for them up front:
+
+- **The container must listen on `$PORT`, not a hardcoded port.** Cloud
+  Run injects `PORT=8080` and health-checks that port; a hackathon
+  Dockerfile that hardcodes `--bind 0.0.0.0:5000` (or similar) will build
+  fine and then fail to deploy with a "failed to start and listen on the
+  port" error. Fix at the entrypoint, falling back to the old hardcoded
+  port so any existing non-Cloud-Run deploy path (docker-compose, a VM)
+  keeps working unchanged:
+  `ENTRYPOINT ["sh", "-c", "gunicorn --bind 0.0.0.0:${PORT:-5000} ..."]`
+- **`gcloud run deploy --source` can't pass a `--build-arg` through to a
+  Dockerfile build.** If the frontend needs a build-time env var baked in
+  (e.g. a Maps API key read via `import.meta.env` at build time, not
+  runtime), `gcloud run deploy --source .` has no flag for it. Use a
+  two-step deploy instead: a custom `cloudbuild.yaml` that runs
+  `docker build --build-arg KEY=$_KEY -t $_IMAGE .` via
+  `gcloud builds submit --substitutions=_KEY=...`, then
+  `gcloud run deploy --image=$_IMAGE`. `scripts/deploy.sh` and
+  `.github/workflows/deploy.yml` should both do these same two steps.
+- **A scoped CI service account can build successfully and still report
+  failure**, because `gcloud builds submit` waits by streaming build logs,
+  and streaming from the default GCS logs bucket only recognizes the
+  primitive `Viewer`/`Owner` project roles - not a least-privilege custom
+  role, even one with `cloudbuild.builds.editor`. The build itself
+  actually succeeds; only the CLI's log tail fails. Fix: add to
+  `cloudbuild.yaml`
+  ```yaml
+  options:
+    logging: CLOUD_LOGGING_ONLY
+  ```
+  and grant the CI service account `roles/logging.viewer` (in addition to
+  the roles already listed in the WIF section below).
+- **Old Dockerfiles drift as base images move forward.** `python:3.11-slim`
+  (and similar floating tags) resolve to whatever Debian release is
+  current *now*, not whatever it was when the Dockerfile was written. A
+  hackathon Dockerfile's `apt-get install -y libgl1-mesa-glx` (a common
+  opencv dependency) can start failing with "has no installation
+  candidate" months later because that package was renamed/split upstream
+  (`libgl1` + `libglib2.0-0`, in this case) on the newer Debian release.
+  If an `apt-get install` step in an old Dockerfile suddenly fails, check
+  whether the package was renamed before assuming anything else is wrong.
+
+## Non-GCP dependencies (AWS, etc.)
+
+Hackathon backends often reach out to a non-GCP service - most commonly
+AWS (DynamoDB/S3), authenticated via a local credentials file
+(`~/.aws`) mounted into the container. That mount trick doesn't work on
+Cloud Run (no local filesystem to mount from, no way to hand it a file at
+deploy time short of baking a static key into a secret and managing its
+rotation forever).
+
+Before wiring up a standing external credential as a Cloud Run secret,
+check whether the dependency has a native GCP equivalent that needs no
+credentials at all: DynamoDB -> a dedicated Firestore database (per the
+siloing convention above), S3 -> a dedicated Cloud Storage bucket. On
+Cloud Run, both authenticate automatically via the service's own service
+account (grant it `roles/datastore.user` / `roles/storage.objectAdmin` as
+needed) - nothing to rotate, nothing to leak. Only reach for a real
+external secret when there's no GCP equivalent (e.g. a third-party API
+that only exists outside GCP).
 
 ## Custom domain
 
@@ -174,6 +254,14 @@ gcloud billing budgets create \
   --project=vietrochack-lab
 ```
 
+Note if several apps share one GCP project (the common case here): each
+app's budget alert fires against that *whole project's* total spend, not
+just its own app's usage - they're independent alerts on the same number,
+not additive per-app slices. Multiple budgets on a shared project is
+normal (per this guide's own convention above) and gives redundant alerts
+rather than more precise ones; that's fine, just don't expect a budget
+named `<app>` to isolate that app's actual cost.
+
 ```bash
 # Artifact Registry cleanup policy - every Cloud Functions deploy (especially
 # from CI on every push) builds a new container image that is NOT auto-deleted.
@@ -185,10 +273,59 @@ cat > /tmp/cleanup-policy.json <<'EOF'
   { "name": "delete-old-tagged", "action": {"type": "Delete"}, "condition": {"tagState": "ANY", "olderThan": "7776000s"} }
 ]
 EOF
-gcloud artifacts repositories set-cleanup-policies gcf-artifacts \
+gcloud artifacts repositories set-cleanup-policies <repo> \
   --project=vietrochack-lab --location=us-central1 \
   --policy=/tmp/cleanup-policy.json --no-dry-run
 ```
+
+`<repo>` is `gcf-artifacts` for a Cloud Functions deploy (auto-created for
+you). For Cloud Run built via `gcloud builds submit`/`gcloud run deploy
+--image`, create your own named repo first
+(`gcloud artifacts repositories create <app> --repository-format=docker
+--location=us-central1`) and use that name instead - same reasoning as
+every other resource in this doc, don't dump every app's images into one
+shared, unscoped repo.
+
+## Third-party API keys: browser-restricted vs. secret-stored
+
+Not every key needs Secret Manager. There are two genuinely different
+cases:
+
+- **Client-exposed keys** (a Maps JavaScript key, or anything else that
+  ends up inside the built frontend bundle) are not secrets - anyone can
+  read them out of the shipped JS regardless of where you store them.
+  The actual security boundary is an **HTTP referrer restriction**
+  (`gcloud services api-keys create --allowed-referrers=...`), locking
+  the key to your app's own domains. Passing it as a GitHub Actions
+  secret and a Cloud Build substitution is just about keeping it out of
+  workflow logs/history, not secrecy.
+- **Real server-side keys** (an LLM provider key, anything called only
+  from your backend) belong in Secret Manager, mounted into Cloud Run via
+  `--set-secrets=KEY=secret-name:latest`, with `roles/secretmanager.secretAccessor`
+  granted to the Cloud Run service's own service account (and to the CI
+  deploy service account, so it can attach the binding at deploy time).
+
+Gotcha: `--allowed-referrers` (and similar repeatable-looking flags) does
+**not** accumulate across repeated uses on the same `create`/`update`
+call - each invocation replaces the previous value. Pass every referrer
+as one comma-separated string in a single flag, or call `update` again
+with the full combined list.
+
+Also create these keys scoped to the app's own project/service, following
+the same siloing convention as everything else - a key created under some
+unrelated personal or shared project mixes its quota/billing with
+whatever else uses that key.
+
+**If the backend calls a paid LLM API** (OpenAI is the common hackathon
+default) and there's no budget to keep paying for it post-hackathon,
+check whether the code already abstracts the call behind a configurable
+`base_url` - a lot of hackathon projects that started on OpenAI and later
+added Groq as a cheaper fallback already do this, since Groq's API is
+OpenAI-compatible. If so, swapping to Gemini is usually just adding one
+more config entry pointing at Gemini's own OpenAI-compatible endpoint
+(`https://generativelanguage.googleapis.com/v1beta/openai`) with a
+Gemini API key - no new SDK, no rewritten call sites, and it runs on
+Gemini's free tier by default.
 
 ## CI/CD: GitHub Actions with Workload Identity Federation
 
@@ -207,7 +344,8 @@ gcloud iam service-accounts create gh-actions-deploy-<app> \
 
 for ROLE in roles/cloudfunctions.developer roles/run.admin roles/iam.serviceAccountUser \
             roles/cloudbuild.builds.editor roles/artifactregistry.admin \
-            roles/storage.admin roles/firebasehosting.admin; do
+            roles/storage.admin roles/firebasehosting.admin roles/logging.viewer \
+            roles/secretmanager.secretAccessor; do
   gcloud projects add-iam-policy-binding "$PROJECT_ID" \
     --member "serviceAccount:${SA_EMAIL}" --role "$ROLE"
 done
