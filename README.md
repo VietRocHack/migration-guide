@@ -28,6 +28,19 @@ Grep for `cloudfunctions.net`, `firebaseapp.com`, `firebasestorage`,
 `raw.githubusercontent.com`, and any hardcoded project ID that isn't the
 team's. Read the actual code paths, don't assume from the README.
 
+**Check for an abandoned sibling repo before assuming what needs migrating.**
+Some hackathon teams have a `<app>-frontend` and a `<app>-backend` repo where
+the "backend" repo is actually a dead, never-deployed, single-commit duplicate
+of a feature that was later reimplemented directly inside the frontend repo
+(e.g. as Vercel serverless functions living under the frontend's own `api/`
+dir). Diff what each repo's version of a shared feature actually does before
+treating the separate backend repo as the source of truth — it may just be an
+early draft to discard, with the real, currently-deployed logic sitting inside
+the frontend repo instead. Also watch for `.md`/`requirements.txt` files
+authored on Windows and saved as **UTF-16** instead of UTF-8 — they read as
+garbled/spaced-out garbage with naive tools; decode explicitly before trusting
+"there's nothing here."
+
 ## Naming and siloing in `vietrochack-lab`
 
 `vietrochack-lab` hosts more than one project. Every app needs to be
@@ -107,6 +120,39 @@ teammate's personal fork on every request, bundle that data with the deploy
 instead (copy it alongside the function's source, read it from disk). Don't
 leave a live app's correctness dependent on someone else's GitHub repo
 staying up and unchanged forever.
+
+**A third topology: static frontend + Cloud Run backend, no Cloud Functions
+at all.** When the frontend has no server-only features (a Next.js/CRA/Vite
+app that's 100% client components, safe to fully static-export) and the
+backend is a real persistent multi-route server (not a single function),
+don't force either side into the other two patterns above. Export the
+frontend statically and deploy it straight to the Hosting site's `public`
+dir, and rewrite only the API path to the Cloud Run service, same one-origin
+rewrite mechanism, just a different rewrite target:
+
+```json
+{ "source": "/api/**", "run": { "serviceId": "<app>-server", "region": "us-central1" } }
+```
+
+This keeps the frontend deploy (fast, free, no container) and backend deploy
+(a real server, scales independently) fully decoupled, while still living
+behind one domain with no CORS. Don't reach for the "Cloud Run serves
+everything, including the frontend build" pattern above just because the
+backend happens to be on Cloud Run too — that pattern is specifically for
+when the backend *already* serves its own frontend build as one process; if
+it doesn't, keep them separate.
+
+**Stateful multi-turn LLM APIs have no drop-in equivalent across providers.**
+A hackathon backend built on OpenAI's Assistants API (threads/runs, state
+held server-side on OpenAI's platform) can't be swapped to Gemini (or most
+other providers) by just changing an SDK call — Gemini has no stateful
+"thread" primitive. The conversation history has to move into your own store
+(a Firestore doc keyed by the session/call id is the natural fit on this
+stack, per the siloing convention above) and be replayed into each request
+explicitly. Same goes for the "assistant" configuration itself (system
+prompt/instructions, response-format contract): on OpenAI's Assistants API
+that config lives in OpenAI's dashboard, not in the repo at all, so it has to
+be rediscovered/rewritten from scratch, not copied.
 
 ## Step by step
 
