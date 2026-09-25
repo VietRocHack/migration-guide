@@ -65,6 +65,15 @@ Related rules:
   Store the history yourself (a Firestore doc per session) and replay it on
   each request. The assistant's prompt and config live in OpenAI's dashboard,
   not the repo, so they have to be rewritten.
+- **Voice pipelines (Vapi, Deepgram + LLM + TTS) collapse into Gemini Live.**
+  Use one native audio session per visitor, relayed server-to-server over a
+  WebSocket so the key stays on the server (YoungHeroes, TeachXR). Three
+  things we learned:
+  - Send images as `send_client_content` turns with an inline image part.
+    `send_realtime_input(video=...)` frames aren't reliably tied to the
+    question that follows.
+  - Realtime audio/text and client-content turns mix fine in one session.
+  - `session.receive()` returns after each turn, so re-enter it in a loop.
 
 ## 3. Name everything per app
 
@@ -111,6 +120,24 @@ firebase deploy --only hosting:<app> --project vietrochack-lab
 
 ### Cloud Run gotchas
 
+- **Build into the app's own Artifact Registry repo.** `gcloud run deploy --source`
+  pushes to the shared `cloud-run-source-deploy` repo, so the per-app cleanup
+  policy (§6) never applies. Build with a tiny `cloudbuild.yaml` instead, then
+  deploy the image. This also gives you the CLOUD_LOGGING_ONLY fix below for free:
+  ```yaml
+  steps:
+    - name: gcr.io/cloud-builders/docker
+      args: ['build', '-t', '$_IMAGE', '.']
+  images: ['$_IMAGE']
+  options:
+    logging: CLOUD_LOGGING_ONLY
+  ```
+  ```bash
+  IMAGE=us-central1-docker.pkg.dev/vietrochack-lab/<app>/server:$(git rev-parse --short HEAD)
+  gcloud builds submit backend --config=backend/cloudbuild.yaml --substitutions=_IMAGE="$IMAGE"
+  gcloud run deploy <app>-server --image="$IMAGE" ...
+  ```
+
 - **Listen on `$PORT`.** Hardcoded ports build fine but then fail to start.
   Keep the old port as a fallback:
   `ENTRYPOINT ["sh", "-c", "gunicorn --bind 0.0.0.0:${PORT:-5000} ..."]`
@@ -124,6 +151,9 @@ firebase deploy --only hosting:<app> --project vietrochack-lab
   `cloudbuild.yaml` and grant `roles/logging.viewer`.
 - **Floating base images drift.** An old `apt-get install` can break because a
   package was renamed upstream (e.g. `libgl1-mesa-glx` → `libgl1` + `libglib2.0-0`).
+- **Windows: stop the Vite dev server before `npm ci`.** It holds
+  `esbuild.exe` open, so `npm ci` fails partway and leaves `node_modules`
+  half-deleted. The next build then fails, or a deploy ships a stale `dist/`.
 - **Pinned deps can conflict silently.** Adding a package locally may upgrade
   another pinned package in your venv, so local tests pass while the clean
   container build fails. Resolve against a clean install before pushing.
@@ -162,6 +192,10 @@ This is a permanent deploy, so set these up on day one.
 ```bash
 # Budget alert. It watches the WHOLE project's spend, not just this app's:
 # per-app budgets on a shared project are redundant alarms, not per-app slices.
+# So check first; vietrochack-lab already has a project-wide one. Without
+# --billing-project the call runs against your active quota project and fails.
+gcloud billing budgets list --billing-account=<billing account id> --billing-project=vietrochack-lab
+
 gcloud billing budgets create \
   --billing-account=<billing account id> --display-name="<app> budget" \
   --budget-amount=10USD --calendar-period=month \
@@ -184,7 +218,15 @@ gcloud artifacts repositories set-cleanup-policies <repo> \
 
 **Public endpoints that call a paid API** (an LLM, etc.) also need abuse limits.
 Set a spend cap in AI Studio and `--max-instances` on Cloud Run, and rate-limit
-the endpoint. See YoungHeroes' `docs/adr/0006-abuse-prevention.md`.
+the endpoint. See YoungHeroes' `docs/adr/0006-abuse-prevention.md` and
+TeachXR's `docs/adr/0005-abuse-prevention.md`.
+
+Rate-limit counters and session tickets in Firestore pile up forever unless
+you give them an `expiresAt` field and a TTL policy:
+
+```bash
+gcloud firestore fields ttls update expiresAt --collection-group=<collection>   --enable-ttl --database=<app> --project=vietrochack-lab
+```
 
 ## 7. Keys and secrets
 
@@ -195,6 +237,22 @@ the endpoint. See YoungHeroes' `docs/adr/0006-abuse-prevention.md`.
 
 Gotcha: `--allowed-referrers` doesn't add up when you repeat it. The last flag wins.
 Pass all referrers as one comma-separated value.
+
+**Creating a server-only Gemini key without ever printing it.** Restrict it to
+the Generative Language API and pipe it straight into Secret Manager:
+
+```bash
+gcloud services api-keys create --display-name="<App>"   --api-target=service=generativelanguage.googleapis.com   --project=vietrochack-lab --format=json > /tmp/key.json
+python -c "import json;d=json.load(open('/tmp/key.json'));print(d.get('response',d)['keyString'],end='')"   | gcloud secrets create <app>-gemini-api-key --data-file=- --project=vietrochack-lab
+rm /tmp/key.json
+```
+
+Model names get retired, so check what the key can use before choosing one.
+Live models are the ones that support `bidiGenerateContent`:
+
+```bash
+curl -s "https://generativelanguage.googleapis.com/v1beta/models?pageSize=200"   -H "x-goog-api-key: $(gcloud secrets versions access latest --secret=<app>-gemini-api-key --project=vietrochack-lab)"
+```
 
 **No budget for OpenAI anymore?** If the code already uses a configurable
 `base_url` (common when Groq was added as a fallback), point it at Gemini's
@@ -249,6 +307,10 @@ In `deploy.yml`: `permissions: id-token: write`, then
 `google-github-actions/auth@v2` with `vars.WORKLOAD_IDENTITY_PROVIDER` and
 `vars.GCP_SERVICE_ACCOUNT`. No secrets needed. RocMap's workflow is a full example.
 
+If the first run right after this setup fails with
+`iam.serviceAccounts.getAccessToken ... denied`, the new bindings haven't
+propagated yet (it takes about a minute). Rerun it; nothing is misconfigured.
+
 ## 9. Docs scaffolding
 
 Every migrated app gets these, so the next person (or AI agent) has context:
@@ -266,10 +328,17 @@ Every migrated app gets these, so the next person (or AI agent) has context:
 ## 10. Branding
 
 - Favicon: [`icon.svg`](https://github.com/VietRocHack/home/blob/main/public/icon.svg)
-  from `home` (`<link rel="icon" type="image/svg+xml" ...>`).
+  from `home` (`<link rel="icon" type="image/svg+xml" ...>`), unless the app
+  has its own mark (TeachXR uses its orb).
 - Footer: `© <year> VietRocHack` linking to [vietrochack.com](https://vietrochack.com),
   plus the Devpost link if there is one.
 - Add the app to the Projects section of [`home`](https://github.com/VietRocHack/home).
+- **Third-party assets (models, textures, fonts, images):** keep a credits list
+  with the source and license of each one, in the runbook. CC0 needs nothing,
+  but **CC BY needs visible attribution**, both in the README and somewhere
+  in the app (an about or footer line). Strip any other company's logos baked
+  into a model's textures. Poly Haven's API rejects clients without a
+  User-Agent header, so send one when scripting downloads.
 
 ## 11. Frontend polish
 
