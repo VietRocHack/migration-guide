@@ -1,317 +1,175 @@
 # migration-guide
 
-How to take a VietRocHack hackathon project off of a teammate's personal
-Firebase/GCP project and put it on the team's own infrastructure, live
-forever at `<app>.vietrochack.com`. Written up after doing this for
-[RocMap](https://github.com/VietRocHack/RocMap), which is the reference
-example throughout.
+How to move a VietRocHack hackathon project off a teammate's personal
+Firebase/GCP project onto the team's `vietrochack-lab` project, live for
+good at `<app>.vietrochack.com`. The worked examples are
+[RocMap](https://github.com/VietRocHack/RocMap), SwipeAndFly and YoungHeroes.
 
-This is a playbook, not a script. Read it, adapt it, don't blindly copy
-commands, especially resource names and project IDs.
+This is a playbook, not a script. Adapt names and IDs; don't paste blindly.
 
-## Before you start: find what's actually broken
+## The checklist
 
-Hackathon projects almost always have hardcoded references to whoever's
-personal cloud project they were demoed from. Find these before touching
-anything:
+1. [Find what's broken](#1-find-whats-broken): hardcoded personal URLs, dead repos
+2. [Pick a topology](#2-pick-a-topology): one domain, no CORS
+3. [Name everything per app](#3-name-everything-per-app)
+4. [Deploy](#4-deploy)
+5. [Custom domain](#5-custom-domain)
+6. [Cost safety net](#6-cost-safety-net): budget alert and image cleanup
+7. [Keys and secrets](#7-keys-and-secrets)
+8. [CI/CD with Workload Identity Federation](#8-cicd-github-actions--workload-identity-federation)
+9. [Docs scaffolding, branding and polish](#9-docs-scaffolding)
+10. [Verify in a real browser, locally and in prod](#12-verify)
 
-- Frontend fetch calls to an absolute `https://*.cloudfunctions.net/...` or
-  `https://*.firebaseapp.com/...` URL
-- Backend code that pulls data from a teammate's personal GitHub fork or
-  branch instead of the data already committed in the repo
-- Image/asset URLs pointing at `firebasestorage.googleapis.com/v0/b/<personal
-  project>...`
-- A root-level `package.json` or config file left over from a different
-  branch/experiment that isn't actually used by the real app
+---
 
-Grep for `cloudfunctions.net`, `firebaseapp.com`, `firebasestorage`,
-`raw.githubusercontent.com`, and any hardcoded project ID that isn't the
-team's. Read the actual code paths, don't assume from the README.
+## 1. Find what's broken
 
-**Check for an abandoned sibling repo before assuming what needs migrating.**
-Some hackathon teams have a `<app>-frontend` and a `<app>-backend` repo where
-the "backend" repo is actually a dead, never-deployed, single-commit duplicate
-of a feature that was later reimplemented directly inside the frontend repo
-(e.g. as Vercel serverless functions living under the frontend's own `api/`
-dir). Diff what each repo's version of a shared feature actually does before
-treating the separate backend repo as the source of truth — it may just be an
-early draft to discard, with the real, currently-deployed logic sitting inside
-the frontend repo instead. Also watch for `.md`/`requirements.txt` files
-authored on Windows and saved as **UTF-16** instead of UTF-8 — they read as
-garbled/spaced-out garbage with naive tools; decode explicitly before trusting
-"there's nothing here."
+Grep for these, then read the code paths that use them (don't trust the README):
 
-## Naming and siloing in `vietrochack-lab`
+| Search for | Usually means |
+|---|---|
+| `cloudfunctions.net`, `firebaseapp.com` | Frontend calling a personal backend URL |
+| `firebasestorage` | Images hosted in a personal bucket |
+| `raw.githubusercontent.com` | Backend fetching data from someone's fork on every request |
+| Any project ID that isn't the team's | Everything else |
 
-`vietrochack-lab` hosts more than one project. Every app needs to be
-scoped so it doesn't collide with, or get confused with, whatever else is
-in there.
+Also watch for:
+- **Leftover config**, like a root `package.json` from an old branch that the app doesn't use.
+- **Dead sibling repos.** An `<app>-backend` repo may be an abandoned draft,
+  with the real logic living in the frontend repo (e.g. Vercel functions
+  under `api/`). Diff the two before picking a source of truth.
+- **UTF-16 files.** Windows-saved `.md` or `requirements.txt` files can look like
+  garbage to naive tools. Decode them before concluding they're empty.
 
-- **Cloud Functions**: prefix with the app name. `rocmap-findDirection`, not
-  `findDirection`.
-- **Firebase Hosting**: give every app its own **named Hosting site**, never
-  the project's default site. Site IDs are globally unique across *all* of
-  Firebase (not just this project), so `<app>` alone will often be taken;
-  fall back to something like `vietrochack-<app>`. Map it to a Hosting
-  **target** in `.firebaserc` so `firebase deploy --only hosting:<app>` works
-  cleanly.
-- **Database, if the app needs one**: a dedicated named Firestore database
-  per app (`gcloud firestore databases create --database=<app>`), not the
-  project's shared `(default)` database.
-- **Storage, if the app needs one**: a dedicated bucket per app
-  (`vietrochack-lab-<app>`), not a shared bucket with path prefixes.
+## 2. Pick a topology
 
-## Deploy topology: one origin, no CORS
+Always put the frontend and backend on **one domain** with a Firebase
+Hosting rewrite. The frontend calls a relative `/api/...` path, so there's no CORS
+and only one DNS record. Pick the row that matches the app:
 
-Put the frontend and backend behind the **same domain** using a Firebase
-Hosting rewrite, instead of a separate `api.<app>.vietrochack.com`
-subdomain:
+| The app is… | Deploy as | Hosting rewrite |
+|---|---|---|
+| Static frontend + a single HTTP function | Cloud Function (gen2). Don't convert it to Cloud Run. | `{"source": "/api/**", "function": {"functionId": "<app>-<fn>", "region": "us-central1"}}` |
+| Static frontend + a real multi-route server | Frontend on Hosting, backend on Cloud Run | `{"source": "/api/**", "run": {"serviceId": "<app>-server", "region": "us-central1"}}` |
+| One server that already serves its own frontend build | Cloud Run only; `public` points at an empty placeholder dir | `{"source": "**", "run": {"serviceId": "<app>-server", "region": "us-central1"}}` |
 
-```json
-{
-  "hosting": {
-    "target": "<app>",
-    "public": "<frontend build dir>",
-    "rewrites": [
-      {
-        "source": "/api/**",
-        "function": { "functionId": "<app>-<function>", "region": "us-central1" }
-      },
-      { "source": "**", "destination": "/index.html" }
-    ]
-  }
-}
-```
+Always end the rewrites with `{ "source": "**", "destination": "/index.html" }`
+(except in the Cloud-Run-serves-everything case).
 
-The frontend then calls a relative `/api/...` path instead of an absolute
-Cloud Function URL. This removes CORS entirely and means there's only one
-DNS record to manage, not two.
+Related rules:
+- **Static assets** from Firebase Storage should ship with the Hosting deploy. No bucket needed.
+- **Data fetched from someone's GitHub** should be bundled with the deploy and read from disk.
+- **WebSockets don't pass through Hosting rewrites.** The upgrade gets stripped and the request 404s. Connect straight to the Cloud Run URL for those (YoungHeroes).
+- **Stateful LLM APIs don't port between providers.** OpenAI's Assistants API
+  keeps threads and config on OpenAI's side, and Gemini has no equivalent.
+  Store the history yourself (a Firestore doc per session) and replay it on
+  each request. The assistant's prompt and config live in OpenAI's dashboard,
+  not the repo, so they have to be rewritten.
 
-**Cloud Functions (gen2) vs Cloud Run**: if the backend is already a single
-HTTP function (Python's `functions_framework`, Node's `onRequest`, etc.),
-deploy it as a Cloud Function directly, don't rewrite it into a long-running
-Cloud Run service for no reason. Cloud Run is the right call when the
-backend is a real persistent server (Express app, etc.) or needs something
-Functions can't do.
+## 3. Name everything per app
 
-If the backend is a persistent server that *already* serves the built
-frontend itself (a Flask/Express app with the frontend's static build
-copied into its own container, one process, one port - common in
-hackathon projects that never split frontend/backend hosting), don't
-also deploy the frontend build to Hosting separately. Just rewrite
-*everything* to Cloud Run:
+`vietrochack-lab` hosts many apps, so scope every resource to its app:
 
-```json
-{ "source": "**", "run": { "serviceId": "<app>-server", "region": "us-central1" } }
-```
+| Resource | Convention |
+|---|---|
+| Cloud Function | `<app>-<function>` |
+| Cloud Run service | `<app>-server` |
+| Hosting site | Its own named site, never the default. IDs are globally unique, so use `vietrochack-<app>` if `<app>` is taken. Map it to a target in `.firebaserc`. |
+| Firestore | A dedicated named database: `gcloud firestore databases create --database=<app>` |
+| Storage | A dedicated bucket: `vietrochack-lab-<app>` |
+| Artifact Registry | A dedicated repo named `<app>` (Cloud Run); `gcf-artifacts` is auto-created for Functions |
+| API keys | Created under the app's own project |
 
-with `public` pointing at an empty placeholder directory (Hosting still
-requires one to exist, even though nothing in it is ever served). One
-container, one deploy artifact, no risk of the Hosting-served frontend
-and the container's own copy of it drifting apart.
+## 4. Deploy
 
-Images and other static, rarely-changing assets that a teammate previously
-hosted on Firebase Storage: just ship them as static files through the same
-Hosting deploy instead of provisioning a Storage bucket. One less resource
-to secure.
-
-**Backend data**: if the backend fetches data over the network from a
-teammate's personal fork on every request, bundle that data with the deploy
-instead (copy it alongside the function's source, read it from disk). Don't
-leave a live app's correctness dependent on someone else's GitHub repo
-staying up and unchanged forever.
-
-**A third topology: static frontend + Cloud Run backend, no Cloud Functions
-at all.** When the frontend has no server-only features (a Next.js/CRA/Vite
-app that's 100% client components, safe to fully static-export) and the
-backend is a real persistent multi-route server (not a single function),
-don't force either side into the other two patterns above. Export the
-frontend statically and deploy it straight to the Hosting site's `public`
-dir, and rewrite only the API path to the Cloud Run service, same one-origin
-rewrite mechanism, just a different rewrite target:
-
-```json
-{ "source": "/api/**", "run": { "serviceId": "<app>-server", "region": "us-central1" } }
-```
-
-This keeps the frontend deploy (fast, free, no container) and backend deploy
-(a real server, scales independently) fully decoupled, while still living
-behind one domain with no CORS. Don't reach for the "Cloud Run serves
-everything, including the frontend build" pattern above just because the
-backend happens to be on Cloud Run too — that pattern is specifically for
-when the backend *already* serves its own frontend build as one process; if
-it doesn't, keep them separate.
-
-**Stateful multi-turn LLM APIs have no drop-in equivalent across providers.**
-A hackathon backend built on OpenAI's Assistants API (threads/runs, state
-held server-side on OpenAI's platform) can't be swapped to Gemini (or most
-other providers) by just changing an SDK call — Gemini has no stateful
-"thread" primitive. The conversation history has to move into your own store
-(a Firestore doc keyed by the session/call id is the natural fit on this
-stack, per the siloing convention above) and be replayed into each request
-explicitly. Same goes for the "assistant" configuration itself (system
-prompt/instructions, response-format contract): on OpenAI's Assistants API
-that config lives in OpenAI's dashboard, not in the repo at all, so it has to
-be rediscovered/rewritten from scratch, not copied.
-
-## Step by step
-
-Assumes `gcloud`, `firebase-tools`, and `gh` are installed and authenticated,
-and the app's GCP project already exists under `vietrochack-lab` (or is
-`vietrochack-lab` itself, if apps aren't split into separate projects).
+Assumes `gcloud`, `firebase-tools` and `gh` are installed and logged in.
 
 ```bash
-# 1. Enable Firebase on the project (safe, non-destructive, same project ID)
+# 1. Enable Firebase (non-destructive, same project ID)
 firebase projects:addfirebase vietrochack-lab
 
-# 2. Enable the APIs the deploy needs
+# 2. Enable APIs
 gcloud services enable \
   cloudfunctions.googleapis.com run.googleapis.com cloudbuild.googleapis.com \
-  artifactregistry.googleapis.com eventarc.googleapis.com \
-  billingbudgets.googleapis.com \
+  artifactregistry.googleapis.com eventarc.googleapis.com billingbudgets.googleapis.com \
   --project=vietrochack-lab
 
-# 3. Create the app's own Hosting site + target
+# 3. Create the Hosting site, then write .firebaserc by hand:
+#    "targets": { "vietrochack-lab": { "hosting": { "<app>": ["vietrochack-<app>"] } } }
 firebase hosting:sites:create vietrochack-<app> --project vietrochack-lab
-# then write .firebaserc by hand (firebase target:apply needs an existing
-# firebase.json, which you're about to write anyway):
-#   "targets": { "vietrochack-lab": { "hosting": { "<app>": ["vietrochack-<app>"] } } }
 
-# 4. Deploy the backend function
+# 4. Deploy the backend (Cloud Function shown; Cloud Run: gcloud run deploy)
 gcloud functions deploy <app>-<function> \
   --gen2 --runtime=<runtime> --region=us-central1 \
   --source=<backend dir> --entry-point=<entry point> \
-  --trigger-http --allow-unauthenticated \
-  --project=vietrochack-lab
+  --trigger-http --allow-unauthenticated --project=vietrochack-lab
 
 # 5. Build and deploy the frontend
-cd <frontend dir> && npm run build && cd -
+(cd <frontend dir> && npm run build)
 firebase deploy --only hosting:<app> --project vietrochack-lab
 ```
 
-## Common Cloud Run gotchas
+### Cloud Run gotchas
 
-Things that will burn a build/deploy cycle each if you don't know to look
-for them up front:
-
-- **The container must listen on `$PORT`, not a hardcoded port.** Cloud
-  Run injects `PORT=8080` and health-checks that port; a hackathon
-  Dockerfile that hardcodes `--bind 0.0.0.0:5000` (or similar) will build
-  fine and then fail to deploy with a "failed to start and listen on the
-  port" error. Fix at the entrypoint, falling back to the old hardcoded
-  port so any existing non-Cloud-Run deploy path (docker-compose, a VM)
-  keeps working unchanged:
+- **Listen on `$PORT`.** Hardcoded ports build fine but then fail to start.
+  Keep the old port as a fallback:
   `ENTRYPOINT ["sh", "-c", "gunicorn --bind 0.0.0.0:${PORT:-5000} ..."]`
-- **`gcloud run deploy --source` can't pass a `--build-arg` through to a
-  Dockerfile build.** If the frontend needs a build-time env var baked in
-  (e.g. a Maps API key read via `import.meta.env` at build time, not
-  runtime), `gcloud run deploy --source .` has no flag for it. Use a
-  two-step deploy instead: a custom `cloudbuild.yaml` that runs
+- **`gcloud run deploy --source` can't pass `--build-arg`.** If the frontend
+  needs a build-time env var, deploy in two steps instead: a `cloudbuild.yaml` running
   `docker build --build-arg KEY=$_KEY -t $_IMAGE .` via
   `gcloud builds submit --substitutions=_KEY=...`, then
-  `gcloud run deploy --image=$_IMAGE`. `scripts/deploy.sh` and
-  `.github/workflows/deploy.yml` should both do these same two steps.
-- **A scoped CI service account can build successfully and still report
-  failure**, because `gcloud builds submit` waits by streaming build logs,
-  and streaming from the default GCS logs bucket only recognizes the
-  primitive `Viewer`/`Owner` project roles - not a least-privilege custom
-  role, even one with `cloudbuild.builds.editor`. The build itself
-  actually succeeds; only the CLI's log tail fails. Fix: add to
-  `cloudbuild.yaml`
-  ```yaml
-  options:
-    logging: CLOUD_LOGGING_ONLY
-  ```
-  and grant the CI service account `roles/logging.viewer` (in addition to
-  the roles already listed in the WIF section below).
-- **Old Dockerfiles drift as base images move forward.** `python:3.11-slim`
-  (and similar floating tags) resolve to whatever Debian release is
-  current *now*, not whatever it was when the Dockerfile was written. A
-  hackathon Dockerfile's `apt-get install -y libgl1-mesa-glx` (a common
-  opencv dependency) can start failing with "has no installation
-  candidate" months later because that package was renamed/split upstream
-  (`libgl1` + `libglib2.0-0`, in this case) on the newer Debian release.
-  If an `apt-get install` step in an old Dockerfile suddenly fails, check
-  whether the package was renamed before assuming anything else is wrong.
+  `gcloud run deploy --image=$_IMAGE`.
+- **CI build "fails" but actually succeeded.** A least-privilege service account
+  can't stream the logs. Add `options: { logging: CLOUD_LOGGING_ONLY }` to
+  `cloudbuild.yaml` and grant `roles/logging.viewer`.
+- **Floating base images drift.** An old `apt-get install` can break because a
+  package was renamed upstream (e.g. `libgl1-mesa-glx` → `libgl1` + `libglib2.0-0`).
+- **Pinned deps can conflict silently.** Adding a package locally may upgrade
+  another pinned package in your venv, so local tests pass while the clean
+  container build fails. Resolve against a clean install before pushing.
 
-## Non-GCP dependencies (AWS, etc.)
+### Non-GCP dependencies
 
-Hackathon backends often reach out to a non-GCP service - most commonly
-AWS (DynamoDB/S3), authenticated via a local credentials file
-(`~/.aws`) mounted into the container. That mount trick doesn't work on
-Cloud Run (no local filesystem to mount from, no way to hand it a file at
-deploy time short of baking a static key into a secret and managing its
-rotation forever).
+`~/.aws` credential mounts don't work on Cloud Run. Prefer a GCP equivalent
+that needs no stored key: DynamoDB → a dedicated Firestore DB, S3 → a
+dedicated bucket. Then grant the service's own service account
+`roles/datastore.user` / `roles/storage.objectAdmin`. Use a real external secret
+only when there's no GCP equivalent.
 
-Before wiring up a standing external credential as a Cloud Run secret,
-check whether the dependency has a native GCP equivalent that needs no
-credentials at all: DynamoDB -> a dedicated Firestore database (per the
-siloing convention above), S3 -> a dedicated Cloud Storage bucket. On
-Cloud Run, both authenticate automatically via the service's own service
-account (grant it `roles/datastore.user` / `roles/storage.objectAdmin` as
-needed) - nothing to rotate, nothing to leak. Only reach for a real
-external secret when there's no GCP equivalent (e.g. a third-party API
-that only exists outside GCP).
+## 5. Custom domain
 
-## Custom domain
-
-`firebase-tools` has no CLI command for custom domains. Use the REST API
-directly:
+`firebase-tools` has no CLI command for this, so use the REST API:
 
 ```bash
 TOKEN=$(gcloud auth print-access-token)
+BASE="https://firebasehosting.googleapis.com/v1beta1/projects/vietrochack-lab/sites/vietrochack-<app>/customDomains"
+H=(-H "Authorization: Bearer $TOKEN" -H "X-Goog-User-Project: vietrochack-lab")
 
-# Request the domain
-curl -s -X POST \
-  "https://firebasehosting.googleapis.com/v1beta1/projects/vietrochack-lab/sites/vietrochack-<app>/customDomains?customDomainId=<app>.vietrochack.com" \
-  -H "Authorization: Bearer $TOKEN" -H "X-Goog-User-Project: vietrochack-lab" \
-  -H "Content-Type: application/json" -d '{}'
-
-# Poll for the exact DNS records it wants
-curl -s \
-  "https://firebasehosting.googleapis.com/v1beta1/projects/vietrochack-lab/sites/vietrochack-<app>/customDomains/<app>.vietrochack.com" \
-  -H "Authorization: Bearer $TOKEN" -H "X-Goog-User-Project: vietrochack-lab"
+curl -s -X POST "$BASE?customDomainId=<app>.vietrochack.com" "${H[@]}" \
+  -H "Content-Type: application/json" -d '{}'          # request it
+curl -s "$BASE/<app>.vietrochack.com" "${H[@]}"         # get the DNS records it wants
 ```
 
-This returns a CNAME (`<app>.vietrochack.com` -> `vietrochack-<app>.web.app`)
-and a TXT record (`_acme-challenge.<app>.vietrochack.com`) for cert
-validation. Hand those exact values to whoever manages DNS for
-`vietrochack.com` (Namecheap, as of this writing) - you likely won't have
-access to add them yourself. Poll the same GET afterward:
-`hostState` goes `HOST_UNHOSTED` -> `HOST_ACTIVE`, `ownershipState` goes
-`OWNERSHIP_MISSING` -> `OWNERSHIP_ACTIVE`. Usually resolves well under 24h
-after the records are added.
+Send the returned CNAME (`<app>` → `vietrochack-<app>.web.app`) and TXT
+(`_acme-challenge.<app>`) to whoever manages DNS for `vietrochack.com` (Namecheap).
+Re-poll until `hostState: HOST_ACTIVE` and `ownershipState: OWNERSHIP_ACTIVE`.
+This usually takes under 24h.
 
-## Cost safety net
+## 6. Cost safety net
 
-This is a permanent deploy, not a hackathon demo that gets torn down after
-judging. Set these up once, not as an afterthought:
+This is a permanent deploy, so set these up on day one.
 
 ```bash
-# Budget alert, scoped to just this GCP project (billing accounts are often
-# shared across many personal/team projects - don't alert on their combined spend)
+# Budget alert. It watches the WHOLE project's spend, not just this app's:
+# per-app budgets on a shared project are redundant alarms, not per-app slices.
 gcloud billing budgets create \
-  --billing-account=<billing account id> \
-  --display-name="<app> budget" \
-  --budget-amount=10USD \
-  --calendar-period=month \
+  --billing-account=<billing account id> --display-name="<app> budget" \
+  --budget-amount=10USD --calendar-period=month \
   --filter-projects=projects/vietrochack-lab \
   --threshold-rule=percent=0.5 --threshold-rule=percent=0.9 --threshold-rule=percent=1.0 \
   --project=vietrochack-lab
-```
 
-Note if several apps share one GCP project (the common case here): each
-app's budget alert fires against that *whole project's* total spend, not
-just its own app's usage - they're independent alerts on the same number,
-not additive per-app slices. Multiple budgets on a shared project is
-normal (per this guide's own convention above) and gives redundant alerts
-rather than more precise ones; that's fine, just don't expect a budget
-named `<app>` to isolate that app's actual cost.
-
-```bash
-# Artifact Registry cleanup policy - every Cloud Functions deploy (especially
-# from CI on every push) builds a new container image that is NOT auto-deleted.
-# Left alone this slowly accumulates real storage cost.
+# Image cleanup. Every deploy leaves a container image that's never auto-deleted.
 cat > /tmp/cleanup-policy.json <<'EOF'
 [
   { "name": "keep-minimum-versions", "action": {"type": "Keep"}, "mostRecentVersions": {"keepCount": 3} },
@@ -324,60 +182,30 @@ gcloud artifacts repositories set-cleanup-policies <repo> \
   --policy=/tmp/cleanup-policy.json --no-dry-run
 ```
 
-`<repo>` is `gcf-artifacts` for a Cloud Functions deploy (auto-created for
-you). For Cloud Run built via `gcloud builds submit`/`gcloud run deploy
---image`, create your own named repo first
-(`gcloud artifacts repositories create <app> --repository-format=docker
---location=us-central1`) and use that name instead - same reasoning as
-every other resource in this doc, don't dump every app's images into one
-shared, unscoped repo.
+**Public endpoints that call a paid API** (an LLM, etc.) also need abuse limits.
+Set a spend cap in AI Studio and `--max-instances` on Cloud Run, and rate-limit
+the endpoint. See YoungHeroes' `docs/adr/0006-abuse-prevention.md`.
 
-## Third-party API keys: browser-restricted vs. secret-stored
+## 7. Keys and secrets
 
-Not every key needs Secret Manager. There are two genuinely different
-cases:
+| Key type | Where it goes | What actually protects it |
+|---|---|---|
+| **Client-exposed** (e.g. Maps JS key, anything in the built bundle) | Build-time env var (GitHub secret or Cloud Build substitution, just to keep it out of logs) | An **HTTP referrer restriction**: `gcloud services api-keys create --allowed-referrers=...` |
+| **Server-only** (LLM keys, etc.) | Secret Manager, mounted with `--set-secrets=KEY=secret-name:latest` | Grant `roles/secretmanager.secretAccessor` to the runtime service account and the CI service account. Also restrict the key to the one API it needs. |
 
-- **Client-exposed keys** (a Maps JavaScript key, or anything else that
-  ends up inside the built frontend bundle) are not secrets - anyone can
-  read them out of the shipped JS regardless of where you store them.
-  The actual security boundary is an **HTTP referrer restriction**
-  (`gcloud services api-keys create --allowed-referrers=...`), locking
-  the key to your app's own domains. Passing it as a GitHub Actions
-  secret and a Cloud Build substitution is just about keeping it out of
-  workflow logs/history, not secrecy.
-- **Real server-side keys** (an LLM provider key, anything called only
-  from your backend) belong in Secret Manager, mounted into Cloud Run via
-  `--set-secrets=KEY=secret-name:latest`, with `roles/secretmanager.secretAccessor`
-  granted to the Cloud Run service's own service account (and to the CI
-  deploy service account, so it can attach the binding at deploy time).
+Gotcha: `--allowed-referrers` doesn't add up when you repeat it. The last flag wins.
+Pass all referrers as one comma-separated value.
 
-Gotcha: `--allowed-referrers` (and similar repeatable-looking flags) does
-**not** accumulate across repeated uses on the same `create`/`update`
-call - each invocation replaces the previous value. Pass every referrer
-as one comma-separated string in a single flag, or call `update` again
-with the full combined list.
+**No budget for OpenAI anymore?** If the code already uses a configurable
+`base_url` (common when Groq was added as a fallback), point it at Gemini's
+OpenAI-compatible endpoint
+`https://generativelanguage.googleapis.com/v1beta/openai` with a Gemini key.
+No SDK change is needed, and it runs on the free tier.
 
-Also create these keys scoped to the app's own project/service, following
-the same siloing convention as everything else - a key created under some
-unrelated personal or shared project mixes its quota/billing with
-whatever else uses that key.
+## 8. CI/CD: GitHub Actions + Workload Identity Federation
 
-**If the backend calls a paid LLM API** (OpenAI is the common hackathon
-default) and there's no budget to keep paying for it post-hackathon,
-check whether the code already abstracts the call behind a configurable
-`base_url` - a lot of hackathon projects that started on OpenAI and later
-added Groq as a cheaper fallback already do this, since Groq's API is
-OpenAI-compatible. If so, swapping to Gemini is usually just adding one
-more config entry pointing at Gemini's own OpenAI-compatible endpoint
-(`https://generativelanguage.googleapis.com/v1beta/openai`) with a
-Gemini API key - no new SDK, no rewritten call sites, and it runs on
-Gemini's free tier by default.
-
-## CI/CD: GitHub Actions with Workload Identity Federation
-
-Don't put a GCP service-account key in a GitHub secret. Use Workload
-Identity Federation instead, so GitHub proves its identity per run and gets
-a short-lived credential, no key ever stored anywhere.
+Don't store a service-account key in GitHub. With WIF, GitHub gets a
+short-lived credential per run instead.
 
 ```bash
 PROJECT_ID="vietrochack-lab"
@@ -396,11 +224,11 @@ for ROLE in roles/cloudfunctions.developer roles/run.admin roles/iam.serviceAcco
     --member "serviceAccount:${SA_EMAIL}" --role "$ROLE"
 done
 
+# The "github" pool is shared by all apps; skip this if it already exists.
 gcloud iam workload-identity-pools create "github" \
   --project="$PROJECT_ID" --location="global" --display-name="GitHub Actions Pool"
 
-# One pool ("github") can be shared across every VietRocHack app's project;
-# give each REPO its own provider + attribute-condition inside it
+# One provider per repo, locked to that repo.
 gcloud iam workload-identity-pools providers create-oidc "<app>" \
   --project="$PROJECT_ID" --location="global" --workload-identity-pool="github" \
   --attribute-mapping="google.subject=assertion.sub,attribute.repository=assertion.repository" \
@@ -411,88 +239,53 @@ gcloud iam service-accounts add-iam-policy-binding "$SA_EMAIL" \
   --project="$PROJECT_ID" --role="roles/iam.workloadIdentityUser" \
   --member="principalSet://iam.googleapis.com/projects/${PROJECT_NUMBER}/locations/global/workloadIdentityPools/github/attribute.repository/${REPO}"
 
-# Store as GitHub repo VARIABLES, not secrets - these identifiers aren't
-# sensitive, the security boundary is the attribute-condition above
+# Repo VARIABLES, not secrets. These IDs aren't sensitive.
 gh variable set WORKLOAD_IDENTITY_PROVIDER --repo "$REPO" \
   --body "projects/${PROJECT_NUMBER}/locations/global/workloadIdentityPools/github/providers/<app>"
 gh variable set GCP_SERVICE_ACCOUNT --repo "$REPO" --body "$SA_EMAIL"
 ```
 
-`.github/workflows/deploy.yml` then just needs
-`google-github-actions/auth@v2` with `workload_identity_provider` and
-`service_account` pulled from `vars.*`, `permissions: id-token: write` at
-the job level, and no secrets at all. See RocMap's for a full working
-example.
+In `deploy.yml`: `permissions: id-token: write`, then
+`google-github-actions/auth@v2` with `vars.WORKLOAD_IDENTITY_PROVIDER` and
+`vars.GCP_SERVICE_ACCOUNT`. No secrets needed. RocMap's workflow is a full example.
 
-## Agentic dev-env scaffolding
+## 9. Docs scaffolding
 
-Every migrated app should end up with this structure, so both humans and AI
-agents working on it later have the context they need without rediscovering
-it:
+Every migrated app gets these, so the next person (or AI agent) has context:
 
-- **`CLAUDE.md`** at repo root: repo map, a pointer to read `docs/adr/`
-  before architectural changes, the progress-logging convention, and the
-  actual local dev / deploy commands for *this* app
-- **`docs/adr/`**: one file per real decision (Status/Context/Decision/
-  Consequences), numbered in order. Record deploy topology, any bundled-data
-  or storage-vs-hosting tradeoffs, and the resource-naming convention this
-  app follows.
-- **`docs/product/`**: the original pitch/Devpost writeup, so "why does this
-  exist" survives independent of whoever built it
-- **`docs/progress/YYYYMMDD.md`**: one file per calendar day, a `##` section
-  per work session, written as it happens
-- **`docs/runbook.md`**: the one-time setup checklist (APIs enabled, Hosting
-  site created, DNS records, budget alert, WIF setup) plus anything ongoing
-- **`docs/backlog.md`**: known non-blocking issues and cleanup, checked off
-  as they land
-- **`scripts/deploy.sh`** and **`.github/workflows/deploy.yml`**: the manual
-  and automatic deploy paths, doing the same two steps in the same order
+| File | Contents |
+|---|---|
+| `CLAUDE.md` | Repo map, "read `docs/adr/` first", progress-log rule, local dev and deploy commands |
+| `docs/adr/NNNN-*.md` | One real decision each (Status / Context / Decision / Consequences): topology, storage choices, naming |
+| `docs/product/` | The original pitch / Devpost writeup |
+| `docs/progress/YYYYMMDD.md` | One file per day, one `##` section per work session |
+| `docs/runbook.md` | One-time setup: APIs, Hosting site, DNS, budget, WIF |
+| `docs/backlog.md` | Known non-blocking issues |
+| `scripts/deploy.sh` + `.github/workflows/deploy.yml` | Manual and automatic deploys, doing the same steps in the same order |
 
-## Branding
+## 10. Branding
 
-Every app under `*.vietrochack.com` should carry the same minimal VietRocHack
-identity:
+- Favicon: [`icon.svg`](https://github.com/VietRocHack/home/blob/main/public/icon.svg)
+  from `home` (`<link rel="icon" type="image/svg+xml" ...>`).
+- Footer: `© <year> VietRocHack` linking to [vietrochack.com](https://vietrochack.com),
+  plus the Devpost link if there is one.
+- Add the app to the Projects section of [`home`](https://github.com/VietRocHack/home).
 
-- Use [`icon.svg`](https://github.com/VietRocHack/home/blob/main/public/icon.svg)
-  from the `home` repo as the actual favicon (`<link rel="icon" ...
-  type="image/svg+xml">`), not a generic CRA/Vite default icon
-- A footer with `© <current year> VietRocHack`, linking to
-  [vietrochack.com](https://vietrochack.com), plus a link to the project's
-  Devpost page if it has one
-- After deploying, add the app to the **Projects** section of the
-  [`home`](https://github.com/VietRocHack/home) repo so it's discoverable
-  from the team site
+## 11. Frontend polish
 
-## Frontend polish checklist
+Hackathon UIs are usually tuned for one screen size. Before calling it done:
 
-Hackathon frontends are usually tuned for one screen size (often mobile,
-since that's what gets tested during a sleepless 24 hours) and never
-touched again. Before calling a migration done:
+1. Load the app at ~375px, ~768px and ~1280px+ and actually look at it.
+2. Grep the CSS for classes styled only inside a `@media` block. That's the #1
+   cause of "fine on my phone, broken on a monitor".
+3. Try unhappy paths: missing fields, changed selections, network failures.
+4. Fix layout and bugs, but keep the app's look (colors, fonts, vibe) unless asked.
 
-1. **Actually load the app at multiple real widths** (~375px, ~768px,
-   ~1280px+) and look at it. Don't assume the existing CSS "should" work at
-   a given breakpoint just because it looks reasonable in the source.
-2. **Grep the CSS for classes that only exist inside one media query block.**
-   This is the single most common cause of "looks fine on my phone, broken
-   on a real monitor" - a section styled *only* inside `@media
-   (max-width: ...)` has zero styling outside that range.
-3. **Drive the actual user flow**, not just the happy path: submit with
-   fields missing, change a selection after making a different one, trigger
-   a network failure. Hackathon code rarely guards against any of this.
-4. **Keep the app's actual visual identity.** Polishing means fixing
-   layout/bugs/spacing, not redesigning colors, fonts, or the overall vibe
-   unless asked.
+## 12. Verify
 
-## Verification
+Don't call it done from the diff. Run it:
 
-Don't call a migration or a polish pass done from reading the diff alone.
-Actually run it:
-
-- Local dev server for iterating (add a `proxy` field, or equivalent, so
-  local dev can hit the live backend/assets instead of needing everything
-  running locally)
-- Drive the real UI through a browser automation tool: type into fields,
-  click through dropdowns, submit, check the network tab for the requests
-  that actually fired and their status codes
-- After shipping, load the actual production URL (not just localhost) and
-  repeat the core flow once more
+- Locally, with a dev proxy to the backend.
+- In a real browser: click through the flows and check the network tab for the
+  requests that fired and their status codes.
+- After shipping, repeat the core flow on the **production URL**.
